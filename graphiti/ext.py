@@ -1,18 +1,26 @@
 """Extensions for interacting with the nvgraph bindings.
 
    This module exposes numpy and scipy specific abstractions.
+
+   For simple use-cases where you want to
+       - put a scipy.sparse matrix on GPUs
+       - retrieve shortest or widest paths
+   use `scopedSimpleGraph` and `SimpleGraphView`
 """
 
 # Todo:
 # - do we have to depend on the nvgraph bindings here
 
 import ctypes
+import contextlib
 
 import numpy
 import scipy.sparse
 
 from .nvgraph import libnvgraph
-from .api import CudaDataType, CSRTopology, CSCTopology, setGraphStructure, raiseOnError
+from .api import CudaDataType, raiseOnError, CSRTopology, CSCTopology
+from .api import setGraphStructure, scopedHandle, scopedGraph
+from .api import singleSourceShortestPaths, widestPaths
 
 
 def _isContiguousMemory(a):
@@ -21,11 +29,11 @@ def _isContiguousMemory(a):
 def _isQuadratic2dMatrix(m):
     return len(m.shape) == 2 and m.shape[0] == m.shape[1]
 
+_sparseMatrixTypeMap = {scipy.sparse.csr_matrix: CSRTopology,
+                        scipy.sparse.csc_matrix: CSCTopology}
+
 
 def topoViewfromSciPySparseMatrix(m):
-    _sparseMatrixTypeMap = {scipy.sparse.csr_matrix: CSRTopology,
-                            scipy.sparse.csc_matrix: CSCTopology}
-
     assert type(m) in _sparseMatrixTypeMap
 
     TopoTy = _sparseMatrixTypeMap[type(m)]
@@ -132,3 +140,47 @@ def getGraphEdgeData(handle, desc, dtype, n, i=0):
     raiseOnError(libnvgraph.nvgraphGetEdgeData(handle, desc, view, i))
 
     return a
+
+
+# The SimpleGraphView requires previous allocations on the GPU.
+# It requires at least one vertex storage and one edge storage.
+class SimpleGraphView:
+    def __init__(self, handle, graph, m):
+        self.handle = handle
+        self.graph = graph
+        self.m = m
+
+        self.nvertices = m.shape[0]
+        self.nedges = m.nnz
+
+    def singleSourceShortestPaths(self, source):
+        assert type(self.m) == scipy.sparse.csc_matrix
+
+        singleSourceShortestPaths(self.handle, self.graph, source)
+
+        return getGraphVertexData(self.handle, self.graph, n=self.nvertices, dtype=self.m.data.dtype.type)
+
+    def widestPaths(self, source):
+        assert type(self.m) == scipy.sparse.csc_matrix
+
+        widestPaths(self.handle, self.graph, source)
+
+        return getGraphVertexData(self.handle, self.graph, n=self.nvertices, dtype=self.m.data.dtype.type)
+
+
+# The scopedSimpleGraph contextmanager allocates storage on the GPU
+# and manages its lifetime. It yields a SimpleGraphView abstracting
+# over graph traversals and retrieving the resulting vertex data.
+@contextlib.contextmanager
+def scopedSimpleGraph(m):
+    assert type(m) in _sparseMatrixTypeMap
+
+    with scopedHandle() as handle, scopedGraph(handle) as graph:
+        setGraphStructureFromSciPySparseMatrix(handle, graph, m)
+
+        allocateGraphVertexData(handle, graph, m.data.dtype.type)
+        allocateGraphEdgeData(handle, graph, m.data.dtype.type)
+
+        setGraphEdgeData(handle, graph, m.data)
+
+        yield SimpleGraphView(handle, graph, m)
